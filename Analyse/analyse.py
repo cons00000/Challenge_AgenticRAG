@@ -4,3 +4,8 @@ queries = load_dataset("vidore/vidore_v3_pharmaceuticals", "queries", split="tes
 qrels   = load_dataset("vidore/vidore_v3_pharmaceuticals", "qrels",   split="test")
 # Évaluation : pip install vidore-benchmark
 # Modèles VDR : vidore/colqwen2.5-3b-v1.0  ou  vidore/colpali-v1.3  (HuggingFace transformers)
+
+print("Corpus:")
+print(corpus)
+print("Queries:")
+print(queries)
