@@ -1,1 +1,8 @@
 datasets
+torch
+torchvision
+matplotlib
+seaborn
+sentence_transformers
+colpali_engine
+accelerate
