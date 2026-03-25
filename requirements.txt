@@ -6,3 +6,11 @@ seaborn
 sentence_transformers
 colpali_engine
 accelerate
+numpy
+pandas
+scikit-learn
+transformers
+Pillow
+pyarrow
+langchain
+langchain-core
