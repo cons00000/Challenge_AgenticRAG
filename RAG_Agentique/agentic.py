@@ -1,85 +1,157 @@
 """
-HERMES — Couche agentique ReAct (LangChain)
-Architecture : routage modal automatique + enrichissement croisé
-
-VDR par défaut : ColQwen2.5-v0.2 (late interaction, MaxSim)
-Calibration mise à jour d'après les résultats Q7/Q8 :
-  BioBERT  nDCG@5 = 0.1032
-  ColQwen  nDCG@5 = 0.5718
+HERMES — Couche Agentique ReAct (Bloc 3)
+Couvre : Q9 (catalogue outils) · Q10 (trace ReAct) · Q11 (routage complexité)
+         Q12 (gestion incertitude) · Q13 (journalisation GxP)
 """
 
-import json
 import os
+import json
+import uuid
+import hashlib
 import numpy as np
-import torch
-from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-# ── LangChain imports ─────────────────────────────────────────────────────────
-from mistralai.client import Mistral
+from langgraph.prebuilt import create_react_agent
+from langchain_core.tools import Tool
+from langchain_core.messages import AIMessage
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_mistralai import ChatMistralAI
 
-# ── Device detection ──────────────────────────────────────────────────────────
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-if DEVICE == "cuda":
-    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-print(f"Device : {DEVICE}")
+# ═══════════════════════════════════════════════════════════════════════════════
+# Q9 — CATALOGUE D'OUTILS
+# Chaque outil : signature, conditions d'appel, erreur, supervision
+# ═══════════════════════════════════════════════════════════════════════════════
 
+"""
+CATALOGUE COMPLET DES OUTILS HERMES
+====================================
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PATHS
-# Ce fichier vit dans RAG_Agentique/ — toutes les ressources sont un niveau au-
-# dessus, dans le répertoire racine du projet.
-# ══════════════════════════════════════════════════════════════════════════════
-
-BASE_DIR = Path(__file__).resolve().parent.parent   # → racine du projet
-print(f"Base directory for resources: {BASE_DIR}")
-
-# ── API key check ─────────────────────────────────────────────────────────────
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
-if not MISTRAL_API_KEY:
-    raise EnvironmentError(
-        "MISTRAL_API_KEY manquante.\n"
-        "Définissez-la avant de lancer le script :\n"
-        "  Windows PowerShell : $env:MISTRAL_API_KEY = 'votre-clé'\n"
-        "  Linux/macOS        : export MISTRAL_API_KEY='votre-clé'\n"
-        "Clé disponible sur : https://console.mistral.ai/api-keys"
-    )
-
-TEXT_CORPUS_EMB   = BASE_DIR / "RAG_Text" / "embeddings_textual_corpus.json"
-TEXT_QUERY_EMB    = BASE_DIR / "RAG_Text" / "embeddings_textual_queries.json"
-COLQWEN_CORPUS_PT = BASE_DIR / "RAG_VDR"  / "Colqwen" / "colqwen_corpus_embeddings.pt"
-COLQWEN_QUERY_PT  = BASE_DIR / "RAG_VDR"  / "Colqwen" / "colqwen_query_embeddings.pt"
-TRACE_OUTPUT      = BASE_DIR / "RAG_Agentique" / "trace_hermes.md"
+┌─────────────────┬──────────────────────┬───────────────────────┬────────────────────────────┬──────────────────────┐
+│ Outil           │ Signature            │ Conditions d'appel    │ Comportement erreur        │ Supervision          │
+├─────────────────┼──────────────────────┼───────────────────────┼────────────────────────────┼──────────────────────┤
+│ modal_router    │ (query:str)→dict     │ TOUJOURS en 1er       │ Retourne "both" par défaut  │ Autonome             │
+│ text_retrieval  │ (query:str)→str      │ Si primary="text"     │ Retourne liste vide + msg  │ Autonome             │
+│ visual_retrieval│ (query:str)→str      │ Si primary="visual"   │ Retourne liste vide + msg  │ Autonome             │
+│ fusion_rerank   │ (query:str)→str      │ Si primary="both"     │ Fallback text seul         │ Autonome             │
+│ verify_claim    │ (claim|sources)→dict │ Avant réponse finale  │ verified=False + warning   │ Confirmation requise │
+│ complexity_check│ (query:str)→dict     │ Pré-filtre externe    │ Retourne "complex" par déf  │ Autonome             │
+│ uncertainty_gate│ (scores:list)→dict   │ Avant réponse finale  │ Force escalade si erreur   │ Confirmation requise │
+└─────────────────┴──────────────────────┴───────────────────────┴────────────────────────────┴──────────────────────┘
+"""
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CALIBRATION INTER-MODALE
-# Scores issus de l'évaluation réelle Q7/Q8 sur ViDoRe V3 Pharmaceuticals.
-#
-# PROBLÈME : BioBERT cosine scores et ColQwen MaxSim scores vivent dans des
-# espaces numériques différents (cosine ∈ [-1,1] vs MaxSim ∈ [0, n_tokens*1]).
-# Solution : Z-score normalization empirique pour les comparer dans WSF/RRF.
-#
-# BioBERT  — espace cosinus normalisé, moyenne empirique ≈ 0.42
-# ColQwen  — somme de MaxSim par token, amplitude dépend de la longueur query
-#            → normaliser par n_tokens avant stockage du score
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# Q11 — CLASSIFICATEUR DE COMPLEXITÉ (LLM)
+# Le LLM analyse la requête et décide simple vs complexe
+# ═══════════════════════════════════════════════════════════════════════════════
 
-BIOBERT_SCORE_MEAN  = 0.42
-BIOBERT_SCORE_STD   = 0.15
-COLQWEN_SCORE_MEAN  = 12.5   # MaxSim brut moyen (requête ~39 tokens, sim ≈ 0.32/token)
-COLQWEN_SCORE_STD   = 4.2
+def complexity_check(query: str, llm: ChatMistralAI) -> dict:
+    """
+    Classifie la requête : 'simple' (retrieval direct) ou 'complex' (multi-étapes).
+    Utilise le LLM pour une analyse sémantique réelle de la requête.
+    Appelé comme pré-filtre AVANT le lancement de l'agent.
+    """
+    prompt = f"""Tu es un expert en pharmacovigilance. Analyse cette requête et détermine sa complexité.
+
+Requête : "{query}"
+
+Réponds UNIQUEMENT en JSON valide avec ce format exact :
+{{"level": "simple" ou "complex", "rationale": "explication courte", "recommended_plan": "étapes suggérées"}}
+
+Règles :
+- "simple" : une seule information factuelle à récupérer (ex: "Quel est le temps moyen au diagnostic ?")
+- "complex" : nécessite plusieurs étapes, comparaisons, synthèse ou raisonnement multi-sources (ex: "Quels sont les facteurs de risque associés à...")"""
+
+    try:
+        response = llm.invoke(prompt)
+        content = response.content.strip()
+        # Nettoyer si le LLM ajoute des backticks
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        return json.loads(content)
+    except Exception as e:
+        return {
+            "level": "complex",
+            "rationale": f"Parsing échoué ({e}) — fallback complex par sécurité.",
+            "recommended_plan": "modal_router → retrieval → verify_claim → réponse"
+        }
 
 
-def normalize_score(score: float, mean: float, std: float) -> float:
-    """Z-score normalization pour comparer des espaces hétérogènes."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# Q12 — POLITIQUE D'INCERTITUDE
+# L'agent refuse de répondre si les scores sont trop bas → escalade humaine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+UNCERTAINTY_THRESHOLD = 0.15  # score normalisé minimum acceptable
+
+def uncertainty_gate(scores_json: str) -> dict:
+    """
+    Vérifie si les scores de retrieval sont suffisants pour répondre.
+    Input JSON : '{"scores": [0.10, 0.08, 0.12]}'
+
+    Politique HERMES :
+    - score_max < 0.15  → REFUS + escalade expert humain
+    - 0.15 ≤ score_max < 0.25 → RÉPONSE avec avertissement fort
+    - score_max ≥ 0.25  → RÉPONSE normale
+
+    Exemple de refus :
+    Requête "Quel est l'effet de NVG-047 sur les biomarqueurs rénaux ?"
+    → Aucune page pertinente dans le corpus → L'agent doit refuser
+      plutôt que d'halluciner une réponse médicale.
+    """
+    try:
+        data = json.loads(scores_json)
+        scores = data.get("scores", [])
+    except Exception:
+        return {"decision": "ESCALADE", "reason": "Impossible de parser les scores."}
+
+    if not scores:
+        return {"decision": "ESCALADE", "reason": "Aucun résultat de retrieval."}
+
+    score_max = max(scores)
+
+    if score_max < UNCERTAINTY_THRESHOLD:
+        return {
+            "decision": "REFUS",
+            "score_max": round(score_max, 3),
+            "message": (
+                "⚠️ Confiance insuffisante (score_max={:.3f} < seuil {}).\n"
+                "HERMES ne peut pas répondre avec certitude suffisante.\n"
+                "→ Escalade vers un pharmacovigilant expert recommandée."
+            ).format(score_max, UNCERTAINTY_THRESHOLD),
+        }
+    elif score_max < 0.25:
+        return {
+            "decision": "AVERTISSEMENT",
+            "score_max": round(score_max, 3),
+            "message": "Réponse possible mais avec confiance modérée. Vérification humaine conseillée.",
+        }
+    else:
+        return {
+            "decision": "OK",
+            "score_max": round(score_max, 3),
+            "message": "Confiance suffisante pour répondre.",
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RETRIEVAL BACKENDS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BIOBERT_MEAN, BIOBERT_STD = 0.42, 0.15
+CLIP_MEAN, CLIP_STD = 0.28, 0.12
+
+def _normalize(score, mean, std):
     return (score - mean) / (std + 1e-9)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — RETRIEVAL BACKENDS
-# ══════════════════════════════════════════════════════════════════════════════
+def _load_embeddings(path: str) -> Dict[str, np.ndarray]:
+    with open(path) as f:
+        raw = json.load(f)
+    return {k: np.array(v, dtype=np.float32) for k, v in raw.items()}
 
 @dataclass
 class RetrievedPage:
@@ -91,277 +163,304 @@ class RetrievedPage:
     page_number: Optional[int]
     modality: Literal["text", "visual"]
 
-
-# ── Textual retrieval (BioBERT) ───────────────────────────────────────────────
-
 class TextRetriever:
-    """
-    Retrieval textuel via BioBERT sur les markdown des pages.
-    Optimal pour : narratifs ICSR, descriptions textuelles, facteurs de risque,
-    comparaisons de cas FAERS, texte narratif dense.
-    """
-
-    def __init__(
-        self,
-        corpus_emb_path: str = str(TEXT_CORPUS_EMB),
-        corpus_meta: Optional[Dict] = None,
-    ):
-        with open(corpus_emb_path) as f:
-            raw = json.load(f)
-        if isinstance(raw, dict):
-            ids  = list(raw.keys())
-            embs = [raw[k] for k in ids]
-        elif isinstance(raw, list) and isinstance(raw[0], dict):
-            ids  = [r["id"] for r in raw]
-            embs = [r["embedding"] for r in raw]
-        else:
-            raise ValueError(f"Format JSON inattendu dans {corpus_emb_path}")
-
-        self.corpus_ids    = [str(i) for i in ids]
-        self.corpus_matrix = np.array(embs, dtype=np.float32)
-        self.corpus_meta   = corpus_meta or {}
-
+    def __init__(self, corpus_emb_path: str, corpus_meta: Optional[Dict] = None):
+        self.corpus_embeddings = _load_embeddings(corpus_emb_path)
+        self.corpus_ids = list(self.corpus_embeddings.keys())
+        self.corpus_matrix = np.stack([self.corpus_embeddings[cid] for cid in self.corpus_ids])
+        self.corpus_meta = corpus_meta or {}
         from sentence_transformers import SentenceTransformer
         self.model = SentenceTransformer(
-            "pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb",
-            device=DEVICE,
+            "pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb", device="cpu"
         )
 
     def retrieve(self, query: str, k: int = 5) -> List[RetrievedPage]:
-        q_emb = self.model.encode(
-            f"query: {query}", normalize_embeddings=True
-        ).reshape(1, -1)
-        sims  = (q_emb @ self.corpus_matrix.T).flatten()
+        q_emb = self.model.encode(f"query: {query}", normalize_embeddings=True).reshape(1, -1)
+        sims = (q_emb @ self.corpus_matrix.T).flatten()
         top_k = np.argsort(-sims)[:k]
-
         results = []
         for idx in top_k:
-            cid   = self.corpus_ids[idx]
+            cid = self.corpus_ids[idx]
             score = float(sims[idx])
-            meta  = self.corpus_meta.get(cid, {})
-            results.append(RetrievedPage(
-                corpus_id        = cid,
-                score            = score,
-                normalized_score = normalize_score(score, BIOBERT_SCORE_MEAN, BIOBERT_SCORE_STD),
-                markdown         = meta.get("markdown"),
-                doc_id           = meta.get("doc_id"),
-                page_number      = meta.get("page_number"),
-                modality         = "text",
-            ))
-        return results
-
-
-# ── Visual retrieval — ColQwen2.5 ─────────────────────────────────────────────
-
-class ColQwenRetriever:
-    """
-    Retrieval visuel via ColQwen2.5-v0.2 (late interaction, MaxSim).
-
-    Charge les embeddings pré-calculés depuis les caches .pt produits par Q6 :
-      - colqwen_corpus_embeddings.pt  → list of Tensors (n_patches, 128)
-      - colqwen_query_embeddings.pt   → list of Tensors (n_tokens,  128)
-
-    Score MaxSim : score(q,d) = Σ_{t∈q} max_{p∈d} cos(e_t, e_p)
-    Référence    : Khattab & Zaharia, ColBERT 2020.
-
-    Performance mesurée sur ViDoRe V3 Pharmaceuticals (Q7/Q8) :
-      nDCG@5 = 0.5718  (+0.4687 vs BioBERT)
-    """
-
-    def __init__(
-        self,
-        corpus_pt_path: str = str(COLQWEN_CORPUS_PT),
-        query_pt_path: str  = str(COLQWEN_QUERY_PT),
-        corpus_meta: Optional[Dict] = None,
-    ):
-        print(f"Loading ColQwen2.5 corpus embeddings from {corpus_pt_path}...")
-        corpus_cache     = torch.load(corpus_pt_path, map_location="cpu", weights_only=False)
-        self.corpus_embs = [e.to(DEVICE) for e in corpus_cache["embeddings"]]
-        self.corpus_ids  = [str(cid) for cid in corpus_cache["corpus_ids"]]
-        del corpus_cache
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
-        print(f"  → {len(self.corpus_ids):,} pages | dim example: {self.corpus_embs[0].shape} | device: {DEVICE}")
-
-        # Pre-load query cache for batch evaluation (optional — queries can also be
-        # encoded live via _encode_query_live if query_id is not in cache).
-        self._query_cache: Dict[str, torch.Tensor] = {}
-        self._text_to_emb: Dict[str, torch.Tensor] = {}   # normalized text → embedding
-        if Path(query_pt_path).exists():
-            query_cache = torch.load(query_pt_path, map_location="cpu", weights_only=False)
-            for qid, emb, text in zip(
-                query_cache["query_ids"],
-                query_cache["embeddings"],
-                query_cache.get("query_texts", [""] * len(query_cache["embeddings"])),
-            ):
-                moved = emb.to(DEVICE)
-                self._query_cache[str(qid)] = moved
-                if text:
-                    self._text_to_emb[str(text).strip().lower()] = moved
-            print(f"  → {len(self._query_cache):,} query embeddings pre-loaded from cache")
-
-        self.corpus_meta = corpus_meta or {}
-        self._processor  = None   # lazy-loaded only if live encoding is needed
-        self._model      = None
-
-    @staticmethod
-    def _maxsim(q_emb: torch.Tensor, p_emb: torch.Tensor) -> float:
-        """
-        MaxSim between one query and one page.
-        q_emb : (n_tokens,  dim)
-        p_emb : (n_patches, dim)
-        """
-        q = q_emb.float()
-        p = p_emb.float()
-        q = q / (q.norm(dim=-1, keepdim=True) + 1e-8)
-        p = p / (p.norm(dim=-1, keepdim=True) + 1e-8)
-        sim = torch.matmul(q, p.T)                    # (n_tokens, n_patches)
-        return sim.max(dim=1).values.sum().item()      # Σ max per query token
-
-    def _encode_query_live(self, query: str) -> torch.Tensor:
-        """
-        Live encoding is disabled — corpus fills the 8GB GPU, no room for the model.
-        All queries must be pre-cached in colqwen_query_embeddings.pt.
-        """
-        raise RuntimeError(
-            f"Query not found in ColQwen cache:\n  '{query[:120]}'\n\n"
-            "Live encoding is disabled (GPU full with corpus embeddings).\n"
-            "To add new queries to the cache, run Q6 notebook with the new queries "
-            "and save the resulting colqwen_query_embeddings.pt."
-        )
-
-    def retrieve(self, query: str, k: int = 5,
-                 query_id: Optional[str] = None) -> List[RetrievedPage]:
-        """
-        Retrieve top-k pages via MaxSim.
-        Lookup order:
-          1. query_id exact match in cache
-          2. query text exact match in cache (agent often reformulates queries)
-          3. query text substring match (partial overlap with cached query)
-          4. RuntimeError — live encoding disabled
-        """
-        # 1. query_id exact
-        if query_id and str(query_id) in self._query_cache:
-            q_emb = self._query_cache[str(query_id)]
-        else:
-            # 2. exact text match (normalized)
-            q_norm = query.strip().lower()
-            matched = next(
-                (emb for cached_q, emb in self._text_to_emb.items()
-                 if cached_q == q_norm),
-                None
-            )
-            if matched is None:
-                # 3. best substring overlap
-                matched = max(
-                    self._text_to_emb.items(),
-                    key=lambda kv: len(set(q_norm.split()) & set(kv[0].split())),
-                    default=(None, None),
-                )[1]
-            if matched is not None:
-                q_emb = matched
-            else:
-                q_emb = self._encode_query_live(query)  # raises RuntimeError
-
-        scores = [
-            (cid, self._maxsim(q_emb, p_emb))
-            for cid, p_emb in zip(self.corpus_ids, self.corpus_embs)
-        ]
-        scores.sort(key=lambda x: -x[1])
-
-        results = []
-        for cid, score in scores[:k]:
             meta = self.corpus_meta.get(cid, {})
             results.append(RetrievedPage(
-                corpus_id        = cid,
-                score            = score,
-                normalized_score = normalize_score(score, COLQWEN_SCORE_MEAN, COLQWEN_SCORE_STD),
-                markdown         = meta.get("markdown"),
-                doc_id           = meta.get("doc_id"),
-                page_number      = meta.get("page_number"),
-                modality         = "visual",
+                corpus_id=cid, score=score,
+                normalized_score=_normalize(score, BIOBERT_MEAN, BIOBERT_STD),
+                markdown=meta.get("markdown"), doc_id=meta.get("doc_id"),
+                page_number=meta.get("page_number"), modality="text",
+            ))
+        return results
+
+class VisualRetriever:
+    def __init__(self, corpus_emb_path: str, corpus_meta: Optional[Dict] = None):
+        self.corpus_embeddings = _load_embeddings(corpus_emb_path)
+        self.corpus_ids = list(self.corpus_embeddings.keys())
+        self.corpus_matrix = np.stack([self.corpus_embeddings[cid] for cid in self.corpus_ids])
+        self.corpus_meta = corpus_meta or {}
+        from sentence_transformers import SentenceTransformer
+        self.model = SentenceTransformer("clip-ViT-B-32", device="cpu")
+
+    def retrieve(self, query: str, k: int = 5) -> List[RetrievedPage]:
+        q_emb = self.model.encode(query, normalize_embeddings=True).reshape(1, -1)
+        sims = (q_emb @ self.corpus_matrix.T).flatten()
+        top_k = np.argsort(-sims)[:k]
+        results = []
+        for idx in top_k:
+            cid = self.corpus_ids[idx]
+            score = float(sims[idx])
+            meta = self.corpus_meta.get(cid, {})
+            results.append(RetrievedPage(
+                corpus_id=cid, score=score,
+                normalized_score=_normalize(score, CLIP_MEAN, CLIP_STD),
+                markdown=meta.get("markdown"), doc_id=meta.get("doc_id"),
+                page_number=meta.get("page_number"), modality="visual",
             ))
         return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — MODAL ROUTER
-# ColQwen2.5 est dominant (Δ+0.47 vs BioBERT) — visual par défaut si doute.
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODAL ROUTER (LLM)
+# Le LLM choisit la modalité optimale — plus robuste que le scoring lexical
+# ═══════════════════════════════════════════════════════════════════════════════
 
-VISUAL_KEYWORDS = [
-    "figure", "tableau", "graphique", "courbe", "image", "diagramme",
-    "schéma", "chart", "graph", "table", "plot", "illustration",
-    "pharmacokinetic", "PK", "Forest plot",
-]
-
-TEXT_KEYWORDS = [
-    "cas", "rapport", "narratif", "texte", "section", "résumé",
-    "facteurs de risque", "description", "FAERS", "ICSR", "narrative",
-    "compare", "quels sont", "analyse",
-]
-
-
-def modal_router(query: str) -> Dict[str, Any]:
+def modal_router(query: str, llm: ChatMistralAI) -> dict:
     """
-    Choisit la modalité primaire de retrieval.
-
-    Heuristique en 3 niveaux :
-    1. Signal lexical fort → décision directe
-    2. Signal ambigu      → dual retrieval (ColQwen prioritaire)
-    3. Aucun signal       → visual par défaut (ColQwen nDCG@5 = 0.5718)
+    Choisit la modalité de retrieval via le LLM.
+    Fallback : "both" si le parsing échoue.
     """
-    query_lower  = query.lower()
-    visual_score = sum(1 for kw in VISUAL_KEYWORDS if kw.lower() in query_lower)
-    text_score   = sum(1 for kw in TEXT_KEYWORDS   if kw.lower() in query_lower)
+    prompt = f"""Tu es un expert en pharmacovigilance. Analyse cette requête et détermine la modalité de retrieval optimale.
 
-    total = visual_score + text_score
+Requête : "{query}"
 
-    if total == 0:
+Réponds UNIQUEMENT en JSON valide avec ce format exact :
+{{"primary": "text" ou "visual" ou "both", "confidence": 0.0 à 1.0, "rationale": "explication courte"}}
+
+Règles :
+- "text"   : la réponse est dans du texte narratif (cas cliniques ICSR, descriptions, facteurs de risque, rapports FAERS)
+- "visual" : la réponse est dans une figure, tableau, graphique, courbe PK/PD, Forest plot
+- "both"   : la requête est ambiguë ou nécessite les deux modalités"""
+
+    try:
+        response = llm.invoke(prompt)
+        content = response.content.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        return json.loads(content)
+    except Exception as e:
         return {
-            "primary":    "visual",
-            "confidence": 0.6,
-            "rationale":  "Aucun signal lexical — ColQwen2.5 activé par défaut (nDCG@5=0.5718).",
+            "primary": "both",
+            "confidence": 0.5,
+            "rationale": f"Parsing échoué ({e}) — fallback both par sécurité."
         }
 
-    text_ratio = text_score / total
-    confidence = abs(text_ratio - 0.5) * 2
 
-    if confidence < 0.3:
-        return {
-            "primary":    "both",
-            "confidence": confidence,
-            "rationale":  (
-                f"Signal ambigu (text={text_score}, visual={visual_score}) — "
-                "dual retrieval avec fusion WSF."
-            ),
+# ═══════════════════════════════════════════════════════════════════════════════
+# Q13 — JOURNALISATION GxP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+"""
+SCHÉMA DE JOURNALISATION GxP HERMES
+=====================================
+
+{
+  "log_id":        UUID v4 unique — clé primaire immuable,
+  "session_id":    UUID de la session — regroupe les étapes d'une requête,
+  "timestamp_utc": ISO 8601 UTC — horodatage certifié,
+  "step_type":     "THOUGHT" | "ACTION" | "OBSERVATION" | "FINAL_ANSWER" | "REFUSAL",
+  "step_index":    Numéro d'étape dans la session,
+  "actor":         "HERMES_AGENT" | "USER" | "TOOL:<nom>",
+  "content":       Contenu de l'étape,
+  "tool_name":     Nom de l'outil appelé (null si THOUGHT),
+  "tool_input":    Paramètres envoyés à l'outil,
+  "scores":        Scores de retrieval si applicable,
+  "verified":      Résultat de verify_claim si applicable,
+  "model_name":    Nom du LLM utilisé,
+  "hash_prev":     SHA-256 de l'entrée précédente — chaîne d'intégrité,
+  "hash_self":     SHA-256 de cette entrée
+}
+
+Rétention : 10 ans (exigence EMA/GxP).
+Format : JSON Lines (JSONL) — append-only.
+Backend : Elasticsearch WORM ou Loki avec retention policy.
+
+Exploitation audit EMA :
+- Reconstituer la chaîne causale complète d'une décision agentique
+- Vérifier que verify_claim a bien été appelé avant chaque Final Answer
+- Prouver que le modèle n'a pas changé entre deux sessions (model_name)
+- Détecter toute modification du journal via la chaîne de hachage
+"""
+
+@dataclass
+class GxPLogEntry:
+    session_id: str
+    step_type: Literal["THOUGHT", "ACTION", "OBSERVATION", "FINAL_ANSWER", "REFUSAL"]
+    step_index: int
+    actor: str
+    content: str
+    tool_name: Optional[str] = None
+    tool_input: Optional[str] = None
+    scores: Optional[List[float]] = None
+    verified: Optional[bool] = None
+    model_name: str = "mistral-large-latest"
+    hash_prev: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        entry = {
+            "log_id":        str(uuid.uuid4()),
+            "session_id":    self.session_id,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "step_type":     self.step_type,
+            "step_index":    self.step_index,
+            "actor":         self.actor,
+            "content":       self.content,
+            "tool_name":     self.tool_name,
+            "tool_input":    self.tool_input,
+            "scores":        self.scores,
+            "verified":      self.verified,
+            "model_name":    self.model_name,
+            "hash_prev":     self.hash_prev,
         }
-
-    primary = "text" if text_ratio >= 0.5 else "visual"
-    return {
-        "primary":    primary,
-        "confidence": round(confidence, 2),
-        "rationale":  (
-            f"Signal lexical détecté : text={text_score}, visual={visual_score}. "
-            f"Modalité primaire : {primary}."
-        ),
-    }
+        entry["hash_self"] = hashlib.sha256(
+            json.dumps(entry, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        return entry
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — TOOLS LANGCHAIN
-# ══════════════════════════════════════════════════════════════════════════════
+class GxPLogger:
+    """Journal immuable GxP — append-only, chaîné par hash."""
+    def __init__(self, session_id: str, log_path: Optional[str] = None):
+        self.session_id = session_id
+        self.log_path = log_path or f"hermes_gxp_{session_id[:8]}.jsonl"
+        self._step_index = 0
+        self._last_hash: Optional[str] = None
+
+    def log(self, step_type, actor, content, **kwargs) -> dict:
+        self._step_index += 1
+        entry_obj = GxPLogEntry(
+            session_id=self.session_id,
+            step_type=step_type,
+            step_index=self._step_index,
+            actor=actor,
+            content=content,
+            hash_prev=self._last_hash,
+            **kwargs,
+        )
+        entry = entry_obj.to_dict()
+        self._last_hash = entry["hash_self"]
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return entry
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Q10 — TRACE ReAct : CALLBACK HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class AgentTrace:
+    query: str
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    steps: List[Dict] = field(default_factory=list)
+    final_answer: Optional[str] = None
+    modality_chosen: Optional[str] = None
+
+    def add_step(self, thought, action, action_input, observation):
+        self.steps.append({
+            "step": len(self.steps) + 1,
+            "thought": thought,
+            "action": action,
+            "action_input": action_input,
+            "observation": observation[:600] + "..." if len(observation) > 600 else observation,
+        })
+
+    def to_markdown(self) -> str:
+        lines = [f"# Trace HERMES\n\n**Session :** `{self.session_id}`\n**Requête :** {self.query}\n"]
+        if self.modality_chosen:
+            lines.append(f"**Modalité choisie :** `{self.modality_chosen}`\n")
+        for s in self.steps:
+            lines.append(f"## Étape {s['step']}\n")
+            lines.append(f"**Thought:** {s['thought']}\n")
+            lines.append(f"**Action:** `{s['action']}`  \n**Input:** `{s['action_input']}`\n")
+            lines.append(f"**Observation:**\n```\n{s['observation']}\n```\n")
+        if self.final_answer:
+            lines.append(f"## Réponse finale\n\n{self.final_answer}\n")
+        return "\n".join(lines)
+
+
+class TraceCallbackHandler(BaseCallbackHandler):
+    def __init__(self, trace: AgentTrace, gxp_logger: GxPLogger):
+        self.trace = trace
+        self.logger = gxp_logger
+        self._last_thought = ""
+        self._last_action = ""
+        self._last_input = ""
+
+    def on_llm_end(self, response, **kwargs):
+        if not response.generations:
+            return
+        generation = response.generations[0][0]
+        message = generation.message
+
+        if hasattr(message, "tool_calls") and message.tool_calls:
+            tc = message.tool_calls[0]
+            self._last_action = tc["name"]
+            self._last_input = json.dumps(tc["args"], ensure_ascii=False)
+
+            thought_map = {
+                "modal_router":      "Analyse de la requête pour choisir la modalité de retrieval optimale.",
+                "complexity_check":  "Évaluation de la complexité de la requête (simple vs multi-étapes).",
+                "text_retrieval":    "Retrieval textuel BioBERT sur le corpus — recherche des pages pertinentes.",
+                "visual_retrieval":  "Retrieval visuel CLIP — recherche des pages par contenu visuel.",
+                "fusion_rerank":     "Scores insuffisants ou modalité ambiguë — lancement du dual retrieval avec fusion RRF.",
+                "uncertainty_gate":  "Vérification que les scores de retrieval sont suffisants pour répondre.",
+                "verify_claim":      "Vérification anti-hallucination : l'affirmation est-elle supportée par les sources ?",
+            }
+            self._last_thought = message.content or thought_map.get(self._last_action, f"Appel de {self._last_action}.")
+        else:
+            self._last_action = "Final Answer"
+            self._last_input = ""
+            self._last_thought = message.content or "Toutes les vérifications passées — génération de la réponse finale."
+
+        self.logger.log("THOUGHT", "HERMES_AGENT", self._last_thought)
+
+    def on_tool_end(self, output: Any, **kwargs):
+        from langchain_core.messages import ToolMessage
+        obs_text = str(output.content) if isinstance(output, ToolMessage) else str(output)
+        self.trace.add_step(
+            thought=self._last_thought,
+            action=self._last_action,
+            action_input=self._last_input,
+            observation=obs_text,
+        )
+        self.logger.log(
+            "ACTION", f"TOOL:{self._last_action}", obs_text,
+            tool_name=self._last_action, tool_input=self._last_input,
+        )
+        if self._last_action == "modal_router":
+            try:
+                self.trace.modality_chosen = json.loads(obs_text).get("primary")
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSTRUCTION DES OUTILS LANGCHAIN
+# llm est passé en paramètre pour modal_router et verify_claim
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def make_tools(
     text_retriever: TextRetriever,
-    visual_retriever: ColQwenRetriever,
+    visual_retriever: VisualRetriever,
+    llm: ChatMistralAI,
     k: int = 5,
-) -> Dict[str, Any]:
-    """
-    Retourne un dict {tool_name: callable} et la liste de specs Mistral function-calling.
-    """
+) -> List[Tool]:
 
-    def _format_pages(pages: List[RetrievedPage]) -> str:
+    # Cache partagé : rempli par text/visual_retrieval, lu par verify_claim
+    _retrieval_cache: Dict[str, str] = {}
+
+    def _fmt(pages: List[RetrievedPage]) -> str:
         if not pages:
             return "Aucun résultat trouvé."
         lines = []
@@ -374,359 +473,230 @@ def make_tools(
             )
         return "\n".join(lines)
 
+    # ── Tool 1 : modal_router (LLM) ───────────────────────────────────────────
     def tool_modal_router(query: str) -> str:
-        return json.dumps(modal_router(query), ensure_ascii=False)
+        return json.dumps(modal_router(query, llm), ensure_ascii=False)
 
+    # ── Tool 2 : text_retrieval ───────────────────────────────────────────────
     def tool_text_retrieval(query: str) -> str:
-        return _format_pages(text_retriever.retrieve(query, k=k))
+        pages = text_retriever.retrieve(query, k=k)
+        for p in pages:
+            if p.markdown is not None:
+                _retrieval_cache[p.corpus_id] = p.markdown
+        return _fmt(pages)
 
+    # ── Tool 3 : visual_retrieval ─────────────────────────────────────────────
     def tool_visual_retrieval(query: str) -> str:
-        return _format_pages(visual_retriever.retrieve(query, k=k))
+        pages = visual_retriever.retrieve(query, k=k)
+        for p in pages:
+            if p.markdown is not None:
+                _retrieval_cache[p.corpus_id] = p.markdown
+        return _fmt(pages)
 
+    # ── Tool 4 : fusion_rerank ────────────────────────────────────────────────
     def tool_fusion_rerank(query: str) -> str:
-        text_pages   = text_retriever.retrieve(query, k=k)
-        visual_pages = visual_retriever.retrieve(query, k=k)
-        rrf_scores: Dict[str, float] = {}
-        for rank, p in enumerate(text_pages, 1):
-            rrf_scores[p.corpus_id] = rrf_scores.get(p.corpus_id, 0) + 1 / (60 + rank)
-        for rank, p in enumerate(visual_pages, 1):
-            rrf_scores[p.corpus_id] = rrf_scores.get(p.corpus_id, 0) + 1 / (60 + rank)
-        all_pages   = {p.corpus_id: p for p in text_pages + visual_pages}
-        ranked      = sorted(rrf_scores.items(), key=lambda x: -x[1])
-        fused_pages = [all_pages[cid] for cid, _ in ranked[:k] if cid in all_pages]
-        return _format_pages(fused_pages)
+        tp = text_retriever.retrieve(query, k=k)
+        vp = visual_retriever.retrieve(query, k=k)
+        for p in tp + vp:
+            if p.markdown is not None:
+                _retrieval_cache[p.corpus_id] = p.markdown
+        rrf: Dict[str, float] = {}
+        for rank, p in enumerate(tp, 1): rrf[p.corpus_id] = rrf.get(p.corpus_id, 0) + 1/(60+rank)
+        for rank, p in enumerate(vp, 1): rrf[p.corpus_id] = rrf.get(p.corpus_id, 0) + 1/(60+rank)
+        all_pages = {p.corpus_id: p for p in tp + vp}
+        ranked = sorted(rrf.items(), key=lambda x: -x[1])
+        fused = [all_pages[cid] for cid, _ in ranked[:k] if cid in all_pages]
+        return _fmt(fused)
 
-    def tool_wsf_rerank(query: str) -> str:
-        ALPHA = 0.80
-        text_pages   = text_retriever.retrieve(query, k=k)
-        visual_pages = visual_retriever.retrieve(query, k=k)
-        text_norm    = {p.corpus_id: p.normalized_score for p in text_pages}
-        visual_norm  = {p.corpus_id: p.normalized_score for p in visual_pages}
-        wsf_scores   = {
-            cid: ALPHA * visual_norm.get(cid, 0.0) + (1 - ALPHA) * text_norm.get(cid, 0.0)
-            for cid in set(text_norm) | set(visual_norm)
-        }
-        ranked      = sorted(wsf_scores.items(), key=lambda x: -x[1])
-        all_pages   = {p.corpus_id: p for p in text_pages + visual_pages}
-        fused_pages = [all_pages[cid] for cid, _ in ranked[:k] if cid in all_pages]
-        return _format_pages(fused_pages)
-
+    # ── Tool 5 : verify_claim (LLM sur contenu réel) ─────────────────────────
     def tool_verify_claim(input_str: str) -> str:
         try:
-            parts   = input_str.split("|")
-            src_ids = parts[1].replace("SOURCES:", "").strip().split(",") if len(parts) > 1 else []
-            if not src_ids or not src_ids[0]:
-                return json.dumps({"verified": False, "confidence": 0.0,
-                                   "note": "Aucune source fournie."})
-            return json.dumps({
-                "verified":        True,
-                "confidence":      0.85,
-                "sources_checked": len(src_ids),
-                "note": "Vérification heuristique — remplacer par NLI model en production.",
-            })
+            parts = input_str.split("|")
+            claim = parts[0].replace("CLAIM:", "").strip()
+            src_ids = [s.strip() for s in parts[1].replace("SOURCES:", "").split(",")] if len(parts) > 1 else []
+
+            # Récupérer le contenu réel des sources depuis le cache
+            sources_content = ""
+            missing = []
+            for src_id in src_ids:
+                content = _retrieval_cache.get(src_id, "")
+                if content:
+                    sources_content += f"\n[Source {src_id}]: {content[:500]}"
+                else:
+                    missing.append(src_id)
+
+            if not sources_content:
+                return json.dumps({
+                    "verified": False,
+                    "confidence": 0.0,
+                    "note": f"Sources {missing} introuvables dans le corpus récupéré. Claim non vérifiable."
+                })
+
+            # Appel LLM pour vérification réelle sur le contenu des pages
+            prompt = f"""Tu es un expert en pharmacovigilance. Vérifie si l'affirmation suivante est explicitement supportée par les sources.
+
+Affirmation : "{claim}"
+
+Sources récupérées :
+{sources_content}
+
+Réponds UNIQUEMENT en JSON valide :
+{{"verified": true ou false, "confidence": 0.0 à 1.0, "note": "explication courte"}}
+
+Règles strictes :
+- verified=true UNIQUEMENT si l'affirmation est explicitement présente dans les sources
+- verified=false si l'affirmation est une inférence, généralisation, ou absente des sources
+- En cas de doute → false (contexte GxP : la prudence prime)"""
+
+            response = llm.invoke(prompt)
+            content = response.content.strip()
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            return content
+
         except Exception as e:
-            return json.dumps({"verified": False, "error": str(e)})
+            return json.dumps({"verified": False, "confidence": 0.0, "error": str(e)})
 
-    # ── Callable registry ─────────────────────────────────────────────────────
-    registry = {
-        "modal_router":    tool_modal_router,
-        "text_retrieval":  tool_text_retrieval,
-        "visual_retrieval": tool_visual_retrieval,
-        "fusion_rerank":   tool_fusion_rerank,
-        "wsf_rerank":      tool_wsf_rerank,
-        "verify_claim":    tool_verify_claim,
-    }
+    # ── Tool 6 : uncertainty_gate ─────────────────────────────────────────────
+    def tool_uncertainty_gate(scores_json: str) -> str:
+        return json.dumps(uncertainty_gate(scores_json), ensure_ascii=False)
 
-    # ── Mistral function specs ────────────────────────────────────────────────
-    specs = [
-        {
-            "type": "function",
-            "function": {
-                "name": "modal_router",
-                "description": (
-                    "PREMIER OUTIL À APPELER. Analyse la requête et retourne la modalité "
-                    "optimale : 'text', 'visual', ou 'both'. Par défaut 'visual' "
-                    "(ColQwen2.5 nDCG@5=0.5718)."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"query": {"type": "string", "description": "La requête brute."}},
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "text_retrieval",
-                "description": (
-                    "Retrieval textuel via BioBERT (nDCG@5=0.1032). "
-                    "Optimal pour : narratifs ICSR, facteurs de risque, comparaisons FAERS."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "visual_retrieval",
-                "description": (
-                    "Retrieval visuel via ColQwen2.5 MaxSim (nDCG@5=0.5718, Δ+0.47 vs BioBERT). "
-                    "Optimal pour : figures, tableaux, graphiques PK/PD, Forest plots."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "fusion_rerank",
-                "description": "RRF BioBERT + ColQwen2.5. nDCG@5=0.3673. Utiliser si modal_router retourne 'both'.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "wsf_rerank",
-                "description": (
-                    "WSF α=0.80 ColQwen + 0.20 BioBERT. nDCG@5=0.5727 — meilleur hybride. "
-                    "Préférer à fusion_rerank en contexte GxP."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "verify_claim",
-                "description": (
-                    "Vérifie qu'une affirmation est supportée par les sources. "
-                    "OBLIGATOIRE avant la réponse finale. "
-                    "Format input : 'CLAIM: <affirmation> | SOURCES: <id1,id2,...>'"
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"input_str": {"type": "string"}},
-                    "required": ["input_str"],
-                },
-            },
-        },
+    return [
+        Tool(name="modal_router", func=tool_modal_router,
+             description="PREMIER OUTIL. Analyse sémantique de la requête pour choisir la modalité : 'text', 'visual' ou 'both'. Input: requête brute."),
+        Tool(name="text_retrieval", func=tool_text_retrieval,
+             description="Retrieval textuel BioBERT. Pour narratifs ICSR, facteurs de risque, comparaisons FAERS. Input: requête."),
+        Tool(name="visual_retrieval", func=tool_visual_retrieval,
+             description="Retrieval visuel CLIP. Pour figures, tableaux, graphiques PK/PD, Forest plots. Input: requête."),
+        Tool(name="fusion_rerank", func=tool_fusion_rerank,
+             description="Lance text + visual et fusionne via RRF. Utiliser si modal_router retourne 'both' ou scores insuffisants."),
+        Tool(name="verify_claim", func=tool_verify_claim,
+             description="OBLIGATOIRE avant réponse finale. Vérifie sur le contenu réel des sources qu'une affirmation est supportée. Format: 'CLAIM: <affirmation> | SOURCES: <corpus_id1,corpus_id2>'"),
+        Tool(name="uncertainty_gate", func=tool_uncertainty_gate,
+             description="Vérifie si les scores de retrieval sont suffisants pour répondre. Retourne REFUS/AVERTISSEMENT/OK. Input JSON: '{\"scores\": [0.68, 0.50, ...]}'"),
     ]
 
-    return registry, specs
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SYSTEM PROMPT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SYSTEM_PROMPT = """Tu es HERMES, un assistant pharmacovigilance expert en contexte GxP.
+Tu raisonnes en ReAct : Thought → Action → Observation, en boucle.
+
+RÈGLES STRICTES (non négociables) :
+1. Appelle TOUJOURS modal_router en premier pour choisir la modalité.
+2. Si modal_router retourne "both" OU si les scores normalisés sont < 0.15, appelle fusion_rerank.
+3. Appelle uncertainty_gate avec les scores normalisés avant de conclure.
+   → Si le résultat est "REFUS" : arrête et signale l'impossibilité de répondre.
+4. Appelle verify_claim UNE SEULE FOIS sur l'affirmation principale, puis génère immédiatement la réponse finale.
+5. N'invente JAMAIS d'information médicale sans source vérifiée dans le corpus.
+6. Indique les limitations et l'incertitude dans chaque réponse finale."""
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — SYSTEM PROMPT
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# AGENT FACTORY & RUN
+# ═══════════════════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """\
-Tu es HERMES, un assistant pharmacovigilance expert opérant en contexte GxP.
-
-ARCHITECTURE VDR :
-- Retrieval visuel : ColQwen2.5-v0.2 (late interaction MaxSim) — nDCG@5 = 0.5718
-- Retrieval textuel : BioBERT — nDCG@5 = 0.1032
-- Fusion optimale  : WSF α=0.80 — nDCG@5 = 0.5727
-
-RÈGLES STRICTES :
-1. Commence TOUJOURS par appeler modal_router.
-2. Si modal_router retourne 'visual' ou aucun signal → appelle visual_retrieval.
-3. Si modal_router retourne 'both' → appelle wsf_rerank (préférable à fusion_rerank en GxP).
-4. Si modal_router retourne 'text' → appelle text_retrieval, puis visual_retrieval en enrichissement.
-5. Appelle verify_claim sur chaque affirmation factuelle avant la réponse finale.
-6. Ne génère JAMAIS d'information médicale sans source vérifiée.
-7. Indique explicitement les limitations de tes sources dans la réponse.
-"""
+def build_agent(text_retriever, visual_retriever, model_name="mistral-large-latest", k=5):
+    llm = ChatMistralAI(
+        model=model_name,
+        temperature=0.0,
+        api_key=os.environ["MISTRAL_API_KEY"],
+    )
+    tools = make_tools(text_retriever, visual_retriever, llm=llm, k=k)
+    return create_react_agent(
+        model=llm,
+        tools=tools,
+        prompt=SYSTEM_PROMPT,
+    )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — TRACE
-# ══════════════════════════════════════════════════════════════════════════════
+def run_agent(agent, query: str) -> Tuple[str, AgentTrace, str]:
+    session_id = str(uuid.uuid4())
+    trace = AgentTrace(query=query, session_id=session_id)
+    gxp_logger = GxPLogger(session_id)
+    handler = TraceCallbackHandler(trace, gxp_logger)
 
-@dataclass
-class AgentTrace:
-    query: str
-    steps: List[Dict] = field(default_factory=list)
-    final_answer: Optional[str] = None
-    modality_chosen: Optional[str] = None
+    gxp_logger.log("ACTION", "USER", query)
 
-    def add_step(self, action: str, action_input: str, observation: str):
-        self.steps.append({
-            "step":         len(self.steps) + 1,
-            "action":       action,
-            "action_input": action_input,
-            "observation":  observation[:500] + "..." if len(observation) > 500 else observation,
-        })
+    result = agent.invoke(
+        {"messages": [("user", query)]},
+        config={
+            "callbacks": [handler],
+            "recursion_limit": 10,
+        },
+    )
 
-    def to_markdown(self) -> str:
-        lines = [f"# Trace agentique HERMES\n\n**Requête :** {self.query}\n"]
-        if self.modality_chosen:
-            lines.append(f"**Modalité choisie :** {self.modality_chosen}\n")
-        for s in self.steps:
-            lines.append(f"## Étape {s['step']}\n")
-            lines.append(f"**Action:** `{s['action']}`\n")
-            lines.append(f"**Action Input:** `{s['action_input']}`\n")
-            lines.append(f"**Observation:**\n```\n{s['observation']}\n```\n")
-        if self.final_answer:
-            lines.append(f"## Réponse finale\n\n{self.final_answer}\n")
-        return "\n".join(lines)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — AGENT (Mistral native function-calling loop)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def build_agent(
-    text_retriever: TextRetriever,
-    visual_retriever: ColQwenRetriever,
-    model_name: str    = "mistral-large-latest",
-    temperature: float = 0.0,
-    k: int = 5,
-) -> Dict:
-    """Retourne un dict contenant le client Mistral, les specs tools et le registry."""
-    client          = Mistral(api_key=MISTRAL_API_KEY)
-    registry, specs = make_tools(text_retriever, visual_retriever, k=k)
-    return {"client": client, "model": model_name, "temperature": temperature,
-            "registry": registry, "specs": specs}
-
-
-def run_agent_with_trace(agent: Dict, query: str, max_iterations: int = 10) -> Tuple[str, AgentTrace]:
-    """
-    Boucle ReAct native via l'API Mistral function-calling.
-    Chaque tool call est exécuté localement et le résultat renvoyé au modèle.
-    """
-    client   = agent["client"]
-    registry = agent["registry"]
-    specs    = agent["specs"]
-    trace    = AgentTrace(query=query)
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": query},
-    ]
-
-    for iteration in range(max_iterations):
-        response = client.chat.complete(
-            model       = agent["model"],
-            messages    = messages,
-            tools       = specs,
-            tool_choice = "auto",
-        )
-        msg = response.choices[0].message
-
-        # ── No tool call → final answer ───────────────────────────────────────
-        if not msg.tool_calls:
-            final_answer       = msg.content or ""
-            trace.final_answer = final_answer
-            print(f"\n[HERMES] Final Answer:\n{final_answer}")
-            return final_answer, trace
-
-        # ── Append assistant turn ─────────────────────────────────────────────
-        messages.append({"role": "assistant", "content": msg.content or "",
-                         "tool_calls": msg.tool_calls})
-
-        # ── Execute each tool call ────────────────────────────────────────────
-        for tc in msg.tool_calls:
-            tool_name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments)
-            except (json.JSONDecodeError, TypeError):
-                args = {"query": str(tc.function.arguments)}
-
-            print(f"\n[Tool] {tool_name}({args})")
-            fn          = registry.get(tool_name)
-            observation = fn(**args) if fn else f"Outil inconnu : {tool_name}"
-            print(f"[Obs]  {observation[:200]}...")
-
-            if tool_name == "modal_router":
-                try:
-                    trace.modality_chosen = json.loads(observation).get("primary")
-                except Exception:
-                    pass
-
-            trace.add_step(
-                action       = tool_name,
-                action_input = json.dumps(args, ensure_ascii=False),
-                observation  = observation,
-            )
-
-            messages.append({
-                "role":         "tool",
-                "tool_call_id": tc.id,
-                "name":         tool_name,
-                "content":      observation,
-            })
-
-    final_answer       = "Limite d'itérations atteinte sans réponse finale."
+    # Chercher le dernier AIMessage sans tool_calls pendants
+    final_answer = ""
+    for msg in reversed(result["messages"]):
+        if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+            final_answer = msg.content
+            break
+    final_answer = final_answer or result["messages"][-1].content
     trace.final_answer = final_answer
-    return final_answer, trace
+
+    gxp_logger.log("FINAL_ANSWER", "HERMES_AGENT", final_answer)
+
+    return final_answer, trace, gxp_logger.log_path
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ENTRYPOINT
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# POINT D'ENTRÉE
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    try:
-        text_retriever   = TextRetriever()
-        visual_retriever = ColQwenRetriever()
+    from datasets import load_dataset
 
-        # Populate ColQwen text→embedding index from the ViDoRe dataset
-        # so agent-reformulated queries still get a cache hit.
-        try:
-            from datasets import load_dataset
-            print("Loading query texts for ColQwen text-index...")
-            queries_ds = load_dataset(
-                "vidore/vidore_v3_pharmaceuticals", "queries", split="test"
-            )
-            q_id_col  = next(c for c in queries_ds.column_names if "id" in c.lower())
-            q_txt_col = next(c for c in queries_ds.column_names
-                             if "query" in c.lower() and "id" not in c.lower())
-            qid2text  = dict(zip(
-                queries_ds[q_id_col],
-                queries_ds[q_txt_col],
-            ))
-            for qid, text in qid2text.items():
-                emb = visual_retriever._query_cache.get(str(qid))
-                if emb is not None and text:
-                    visual_retriever._text_to_emb[str(text).strip().lower()] = emb
-            print(f"  → {len(visual_retriever._text_to_emb):,} text entries indexed")
-        except Exception as e:
-            print(f"  [WARNING] Could not build text index: {e}")
+    print("Chargement du corpus ViDoRe...")
+    corpus_ds = load_dataset("vidore/vidore_v3_pharmaceuticals", "corpus", split="test")
+    df_corpus = corpus_ds.to_pandas()
 
-        query = (
-            "En comparant les cas FAERS rapportés sur la buprénorphine, "
-            "quels sont les facteurs de risque associés aux caries ?"
-        )
+    corpus_meta = {}
+    for _, row in df_corpus.iterrows():
+        corpus_meta[str(row["corpus_id"])] = {  # str() — les corpus_id des embeddings sont des strings
+            "markdown":    row["markdown"] or "",
+            "doc_id":      row["doc_id"],
+            "page_number": row["page_number_in_doc"],
+        }
+    print(f"corpus_meta chargé : {len(corpus_meta)} pages")
 
-        agent_app          = build_agent(text_retriever, visual_retriever)
-        answer, full_trace = run_agent_with_trace(agent_app, query)
-        print("answer:", answer)
+    text_retriever = TextRetriever(
+        "RAG_Text/textual/embeddings_textual_corpus.json",
+        corpus_meta=corpus_meta,
+    )
+    visual_retriever = VisualRetriever(
+        "RAG_VDR/visual/embeddings_visual_corpus.json",
+        corpus_meta=corpus_meta,
+    )
 
-        TRACE_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-        with open(TRACE_OUTPUT, "w", encoding="utf-8") as f:
-            f.write(full_trace.to_markdown())
-        print(f"Trace sauvegardée : {TRACE_OUTPUT}")
+    query = (
+        "En comparant les cas FAERS rapportés dans le document sur la buprénorphine "
+        "sublinguale, quels sont les facteurs de risque patient qui semblent associés "
+        "à une évolution plus sévère des caries dentaires ? Génère un résumé structuré."
+    )
 
-    except FileNotFoundError as e:
-        print(f"Erreur : fichier introuvable. {e}")
-    except Exception as e:
-        print(f"Erreur : {e}")
-        raise
+    # Q11 — pré-filtre de complexité (LLM) avant lancement de l'agent
+    llm_for_prefilter = ChatMistralAI(
+        model="mistral-large-latest",
+        temperature=0.0,
+        api_key=os.environ["MISTRAL_API_KEY"],
+    )
+    complexity = complexity_check(query, llm_for_prefilter)
+    print(f"[Q11] Complexité : {complexity['level']} — {complexity['recommended_plan']}")
+
+    agent = build_agent(text_retriever, visual_retriever)
+    answer, trace, log_path = run_agent(agent, query)
+
+    print("\n" + "="*60)
+    print(answer)
+
+    os.makedirs("RAG_Agentique", exist_ok=True)
+    with open("RAG_Agentique/trace_hermes.md", "w", encoding="utf-8") as f:
+        f.write(trace.to_markdown())
+
+    print(f"\n[Q10] Trace : RAG_Agentique/trace_hermes.md")
+    print(f"[Q13] Log GxP : {log_path}")
