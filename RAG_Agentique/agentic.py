@@ -665,11 +665,11 @@ if __name__ == "__main__":
     print(f"corpus_meta chargé : {len(corpus_meta)} pages")
 
     text_retriever = TextRetriever(
-        "RAG_Text/textual/embeddings_textual_corpus.json",
+        "RAG_Text/embeddings_textual_corpus.json",
         corpus_meta=corpus_meta,
     )
     visual_retriever = VisualRetriever(
-        "RAG_VDR/visual/embeddings_visual_corpus.json",
+        "RAG_VDR/CLIP/embeddings_visual_corpus.json",
         corpus_meta=corpus_meta,
     )
 
